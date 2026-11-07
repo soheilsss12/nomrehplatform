@@ -1,0 +1,74 @@
+# تشخیص یک‌بارهٔ هاست — دستی، بدون حلقه، بدون کرون.
+# هدف: دیدن اینکه چرا درخواست برنامه به کایا نمی‌رسد.
+# این فایل چیزی را روی هاست تغییر نمی‌دهد: فقط می‌خواند و گزارش می‌دهد.
+name: host-diagnose
+
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "آدرس هاست (بدون https)"
+        required: true
+        default: "nomreh.arounidea.com"
+      ssh_port:
+        description: "پورت SSH"
+        required: true
+        default: "22"
+      ssh_user:
+        description: "نام کاربری SSH (اگر خالی بماند از secret خوانده می‌شود)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: sshenv
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.HOST_SSH_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          # host key: از secret اگر بود، وگرنه pin نمی‌کنیم (فقط برای همین اجرای تشخیص)
+          if [ -n "${{ secrets.HOST_SSH_FINGERPRINT }}" ]; then
+            printf '%s\n' "${{ secrets.HOST_SSH_FINGERPRINT }}" > ~/.ssh/known_hosts
+            echo "known_hosts from secret" >&2
+          else
+            echo "WARN: HOST_SSH_FINGERPRINT تنظیم نشده — host key pin نشد" >&2
+          fi
+
+      - name: preflight
+        run: |
+          set -x
+          timeout 20 ssh-keyscan -p "${{ inputs.ssh_port }}" -T 10 "${{ inputs.host }}" >/tmp/scan.txt 2>/tmp/scan.err || true
+          wc -l /tmp/scan.txt; cat /tmp/scan.err | head -20
+          timeout 20 bash -c "exec 3<>/dev/tcp/${{ inputs.host }}/${{ inputs.ssh_port }}" && echo "TCP_OPEN" || echo "TCP_CLOSED"
+
+      - name: diagnose
+        if: always()
+        env:
+          SSH_USER: ${{ inputs.ssh_user != '' && inputs.ssh_user || secrets.HOST_SSH_USER }}
+        run: |
+          set -o pipefail
+          USER_="$(printf '%s' "$SSH_USER" | tr -d '\r\n')"
+          test -n "$USER_" || { echo "NO_USER"; exit 1; }
+          ARGS="-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -o PreferredAuthentications=publickey -i $HOME/.ssh/id_deploy -p ${{ inputs.ssh_port }}"
+          run() { timeout 90 ssh $ARGS "$USER_@${{ inputs.host }}" "$1" 2>&1 | tail -40; }
+
+          echo "### WHO";        run 'id; uname -a; node -v 2>/dev/null || true'
+          echo "### APP";        run 'ls -d ~/httpdocs ~/public_html 2>/dev/null; for d in ~/httpdocs ~/public_html; do [ -f "$d/package.json" ] && echo "APP=$d"; done'
+          echo "### KAYA_TCP";   run 'for i in 1 2 3; do s=$(date +%s%3N); timeout 8 bash -c "exec 3<>/dev/tcp/kayaai.ir/443" && echo "TCP_OK $(( $(date +%s%3N)-s ))ms" || echo "TCP_TIMEOUT $(( $(date +%s%3N)-s ))ms"; done'
+          echo "### EGRESS_IP";  run 'curl -s --max-time 8 https://api.ipify.org; echo; curl -s --max-time 8 https://icanhazip.com'
+          echo "### IFACES";     run 'ip -4 addr show 2>/dev/null | grep -E "inet " || ifconfig 2>/dev/null | grep -E "inet "'
+          echo "### ROUTE";      run 'ip route 2>/dev/null | head -5; cat /etc/resolv.conf 2>/dev/null | grep -E "nameserver"'
+          echo "### CONTROL";    run 'curl -s -o /dev/null -w "github:%{http_code} " --max-time 8 https://api.github.com; curl -s -o /dev/null -w "npm:%{http_code}\n" --max-time 8 https://registry.npmjs.org/-/ping'
+          echo "### KAYA_TLS";   run 'curl -sv --max-time 10 https://kayaai.ir/api/models 2>&1 | grep -E "Trying|Connected|SSL_connect|TLS|HTTP/|kex|closed" | head -8'
+
+      - name: summary
+        if: always()
+        run: echo "گزارش کامل در لاگ همین stepها است — خطوط ### را بخوانید."
